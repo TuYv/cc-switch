@@ -31,7 +31,7 @@ import type { AppId } from "@/lib/api/types";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { settingsApi, skillsApi } from "@/lib/api";
 import { toast } from "sonner";
-import { MCP_SKILLS_APP_IDS } from "@/config/appConfig";
+import { SKILLS_APP_IDS } from "@/config/appConfig";
 import { AppCountBar } from "@/components/common/AppCountBar";
 import { AppToggleGroup } from "@/components/common/AppToggleGroup";
 import { ListItemRow } from "@/components/common/ListItemRow";
@@ -113,10 +113,17 @@ const UnifiedSkillsPanel = React.forwardRef<
   }, [skillUpdates]);
 
   const enabledCounts = useMemo(() => {
-    const counts = { claude: 0, codex: 0, gemini: 0, opencode: 0, openclaw: 0 };
+    const counts = {
+      claude: 0,
+      codex: 0,
+      gemini: 0,
+      opencode: 0,
+      openclaw: 0,
+      hermes: 0,
+    };
     if (!skills) return counts;
     skills.forEach((skill) => {
-      for (const app of MCP_SKILLS_APP_IDS) {
+      for (const app of SKILLS_APP_IDS) {
         if (skill.apps[app]) counts[app]++;
       }
     });
@@ -342,7 +349,7 @@ const UnifiedSkillsPanel = React.forwardRef<
         <AppCountBar
           totalLabel={t("skills.installed", { count: skills?.length || 0 })}
           counts={enabledCounts}
-          appIds={MCP_SKILLS_APP_IDS}
+          appIds={SKILLS_APP_IDS}
         />
         <div className="flex items-center gap-1.5">
           <div
@@ -547,7 +554,7 @@ const InstalledSkillListItem: React.FC<InstalledSkillListItemProps> = ({
       <AppToggleGroup
         apps={skill.apps}
         onToggle={(app, enabled) => onToggleApp(skill.id, app, enabled)}
-        appIds={MCP_SKILLS_APP_IDS}
+        appIds={SKILLS_APP_IDS}
       />
 
       <div
@@ -739,6 +746,7 @@ const ImportSkillsDialog: React.FC<ImportSkillsDialogProps> = ({
           gemini: skill.foundIn.includes("gemini"),
           opencode: skill.foundIn.includes("opencode"),
           openclaw: false,
+          hermes: skill.foundIn.includes("hermes"),
         },
       ]),
     ),
@@ -764,6 +772,7 @@ const ImportSkillsDialog: React.FC<ImportSkillsDialogProps> = ({
           gemini: false,
           opencode: false,
           openclaw: false,
+          hermes: false,
         },
       })),
     );
@@ -806,6 +815,7 @@ const ImportSkillsDialog: React.FC<ImportSkillsDialogProps> = ({
                           gemini: false,
                           opencode: false,
                           openclaw: false,
+                          hermes: false,
                         }
                       }
                       onToggle={(app, enabled) => {
@@ -818,12 +828,13 @@ const ImportSkillsDialog: React.FC<ImportSkillsDialogProps> = ({
                               gemini: false,
                               opencode: false,
                               openclaw: false,
+                              hermes: false,
                             }),
                             [app]: enabled,
                           },
                         }));
                       }}
-                      appIds={MCP_SKILLS_APP_IDS}
+                      appIds={SKILLS_APP_IDS}
                     />
                   </div>
                   <div
