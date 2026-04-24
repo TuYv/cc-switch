@@ -105,6 +105,67 @@ fn emoji_for_utilization(pct: f64) -> &'static str {
     }
 }
 
+/// Parse an ISO 8601 reset timestamp and return a human-readable countdown.
+fn format_countdown(resets_at_iso: &str) -> Option<String> {
+    let dt = chrono::DateTime::parse_from_rfc3339(resets_at_iso).ok()?;
+    let secs = dt.signed_duration_since(chrono::Utc::now()).num_seconds();
+    if secs <= 0 {
+        return None;
+    }
+    let days = secs / 86400;
+    let hours = (secs % 86400) / 3600;
+    let mins = (secs % 3600) / 60;
+    Some(if days > 0 {
+        format!("{}d {}h", days, hours)
+    } else if hours > 0 {
+        format!("{}h {}m", hours, mins)
+    } else {
+        format!("{}m", mins)
+    })
+}
+
+/// Returns `(short_label, countdown)` pairs for each tier that has a reset time.
+fn subscription_reset_labels(
+    quota: &crate::services::subscription::SubscriptionQuota,
+) -> Vec<(String, String)> {
+    use crate::services::subscription::{
+        TIER_FIVE_HOUR, TIER_GEMINI_FLASH, TIER_GEMINI_FLASH_LITE, TIER_GEMINI_PRO, TIER_SEVEN_DAY,
+    };
+    let tier_map: &[(&str, &str)] = match quota.tool.as_str() {
+        "gemini" => &[
+            (TIER_GEMINI_PRO, "p"),
+            (TIER_GEMINI_FLASH, "f"),
+            (TIER_GEMINI_FLASH_LITE, "l"),
+        ],
+        _ => &[(TIER_FIVE_HOUR, "h"), (TIER_SEVEN_DAY, "w")],
+    };
+    tier_map
+        .iter()
+        .filter_map(|(tier_name, label)| {
+            let tier = quota.tiers.iter().find(|t| t.name == *tier_name)?;
+            let countdown = format_countdown(tier.resets_at.as_deref()?)?;
+            Some((label.to_string(), countdown))
+        })
+        .collect()
+}
+
+fn format_subscription_reset_summary(
+    quota: &crate::services::subscription::SubscriptionQuota,
+) -> Option<String> {
+    let reset_labels = subscription_reset_labels(quota);
+    if reset_labels.is_empty() {
+        return None;
+    }
+
+    Some(
+        reset_labels
+            .iter()
+            .map(|(label, countdown)| format!("{label} {countdown}"))
+            .collect::<Vec<_>>()
+            .join("  "),
+    )
+}
+
 fn format_subscription_summary(
     quota: &crate::services::subscription::SubscriptionQuota,
 ) -> Option<String> {
@@ -169,7 +230,13 @@ fn format_subscription_summary(
         .map(|(label, u)| format!("{label}{}%", u.round() as i64))
         .collect::<Vec<_>>()
         .join(" ");
-    Some(format!("{emoji} {body}"))
+    let mut summary = format!("{emoji} {body}");
+    if let Some(reset_summary) = format_subscription_reset_summary(quota) {
+        summary.push('\n');
+        summary.push_str("   \u{23F1} ");
+        summary.push_str(&reset_summary);
+    }
+    Some(summary)
 }
 
 fn format_script_summary(result: &crate::provider::UsageResult) -> Option<String> {
@@ -835,6 +902,16 @@ mod tests {
         }
     }
 
+    fn tier_with_reset(name: &str, utilization: f64, reset_after_secs: i64) -> QuotaTier {
+        QuotaTier {
+            name: name.to_string(),
+            utilization,
+            resets_at: Some(
+                (chrono::Utc::now() + chrono::Duration::seconds(reset_after_secs)).to_rfc3339(),
+            ),
+        }
+    }
+
     #[test]
     fn claude_summary_uses_h_and_w_labels() {
         let quota = make_quota(
@@ -845,6 +922,29 @@ mod tests {
         let s = format_subscription_summary(&quota).expect("should format");
         assert!(s.contains("h9%"), "expected h9% in {s}");
         assert!(s.contains("w27%"), "expected w27% in {s}");
+    }
+
+    #[test]
+    fn claude_summary_embeds_reset_countdowns_on_second_line() {
+        let quota = make_quota(
+            "claude",
+            true,
+            vec![
+                tier_with_reset("five_hour", 9.0, 3600),
+                tier_with_reset("seven_day", 27.0, 172800),
+            ],
+        );
+
+        let s = format_subscription_summary(&quota).expect("should format");
+
+        assert!(s.contains("h9%"), "expected h9% in {s}");
+        assert!(s.contains("w27%"), "expected w27% in {s}");
+        assert!(
+            s.contains('\n'),
+            "expected reset countdowns to increase menu row height in {s}"
+        );
+        assert!(s.contains("h "), "expected h reset countdown in {s}");
+        assert!(s.contains("w "), "expected w reset countdown in {s}");
     }
 
     #[test]
