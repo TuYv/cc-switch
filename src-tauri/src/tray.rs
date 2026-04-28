@@ -22,9 +22,10 @@ static TRAY_SECTION_DETAIL_ITEMS: Lazy<
 static TRAY_FOCUSED_APP: Lazy<std::sync::Mutex<Option<AppType>>> =
     Lazy::new(|| std::sync::Mutex::new(None));
 
-/// 最近一次有订阅数据的官方 app，在 TRAY_FOCUSED_APP 指向无数据 app 时作为 fallback。
+/// 最近一次有用量数据的 app（含官方订阅 + Coding Plan 等脚本型用量），
+/// 在 TRAY_FOCUSED_APP 指向无数据 app 时作为环图利用率的 fallback。
 #[cfg(target_os = "macos")]
-static TRAY_LAST_OFFICIAL_APP: Lazy<std::sync::Mutex<Option<AppType>>> =
+static TRAY_LAST_APP_WITH_DATA: Lazy<std::sync::Mutex<Option<AppType>>> =
     Lazy::new(|| std::sync::Mutex::new(None));
 
 /// 托盘菜单文本（国际化）
@@ -212,18 +213,56 @@ pub(crate) fn generate_ring_icon_rgba(utilization_pct: Option<f64>, size: u32) -
     buf
 }
 
-/// 获取指定 app 当前官方订阅的最高 tier 利用率（0–100）。
-/// 当前 provider 非官方或无缓存时返回 None。
+/// 从脚本型用量结果里提取最高 tier 利用率（0–100）。
+///
+/// 与 `format_usage_detail_line` 保持一致：脚本缓存承载 Coding Plan / Copilot /
+/// 自定义脚本三类数据。`tier_pct` 自然降级 —— 缺失 `total` 的余额脚本（DeepSeek、
+/// OpenRouter 等）会返回 None，不会污染环图。
+fn extract_script_pct(result: &crate::provider::UsageResult) -> Option<f64> {
+    if !result.success {
+        return None;
+    }
+    result
+        .data
+        .as_ref()?
+        .iter()
+        .filter_map(tier_pct)
+        .reduce(f64::max)
+}
+
+/// 获取指定 app 当前供应商的最高 tier 利用率（0–100），用作环图取数源。
+///
+/// 优先级（与 `format_usage_detail_line` 对齐）：
+/// 1. 启用了 usage_script 的供应商 → 读脚本缓存。覆盖范围包括：
+///    - 智谱 / Kimi For Coding / MiniMax 等 cn_official 类别的 Coding Plan
+///    - GitHub Copilot（premium quota 的 used/total 是 request 数，比例有意义）
+///    - 任何用户自定义脚本，只要 UsageData 提供有效的 used/total 对
+/// 2. 类别为 official 的供应商（Claude / Codex / Gemini 官方订阅）
+///    → 读 subscription 缓存。
+///
+/// 无缓存或两条路径都拿不到数据时返回 None；余额型脚本（DeepSeek / OpenRouter
+/// 等通常 total = None）会被 `tier_pct` 自然过滤，不污染环图。
 #[cfg(target_os = "macos")]
-fn get_section_subscription_pct(
-    app_state: &crate::store::AppState,
-    app_type: &AppType,
-) -> Option<f64> {
+fn get_section_usage_pct(app_state: &crate::store::AppState, app_type: &AppType) -> Option<f64> {
     let current_id = crate::settings::get_effective_current_provider(&app_state.db, app_type)
         .ok()
         .flatten()?;
     let providers = app_state.db.get_all_providers(app_type.as_str()).ok()?;
     let provider = providers.get(&current_id)?;
+
+    // 脚本型用量优先：覆盖 cn_official 类别的 Coding Plan（智谱 / Kimi / MiniMax），
+    // 这些供应商的数据写入脚本缓存而非 subscription 缓存。
+    if provider.has_usage_script_enabled() {
+        if let Some(pct) = app_state
+            .usage_cache
+            .with_script(app_type, &current_id, extract_script_pct)
+            .flatten()
+        {
+            return Some(pct);
+        }
+    }
+
+    // 官方订阅 fallback（Claude / Codex / Gemini）
     if provider.category.as_deref() != Some("official") {
         return None;
     }
@@ -236,8 +275,8 @@ fn get_section_subscription_pct(
 }
 
 /// 根据主界面焦点和设置计算托盘图标应展示的利用率。
-/// - 有焦点且有数据 → 该 app 的利用率，并记录为 last_official
-/// - 有焦点但无数据（第三方/无订阅）→ fallback 到 last_official
+/// - 有焦点且有数据 → 该 app 的利用率，并记录为 last_app_with_data
+/// - 有焦点但无数据（第三方/无订阅）→ fallback 到 last_app_with_data
 /// - 无焦点记录（启动期）→ 所有 section 的最大值
 #[cfg(target_os = "macos")]
 fn compute_tray_worst_pct(app_state: &crate::store::AppState) -> Option<f64> {
@@ -247,20 +286,20 @@ fn compute_tray_worst_pct(app_state: &crate::store::AppState) -> Option<f64> {
         .clone();
 
     if let Some(ref app_type) = focused {
-        if let Some(pct) = get_section_subscription_pct(app_state, app_type) {
-            // 记录最近有数据的官方 app
-            if let Ok(mut last) = TRAY_LAST_OFFICIAL_APP.lock() {
+        if let Some(pct) = get_section_usage_pct(app_state, app_type) {
+            // 记录最近有数据的 app（含官方订阅 / Coding Plan / Copilot 等脚本型）
+            if let Ok(mut last) = TRAY_LAST_APP_WITH_DATA.lock() {
                 *last = Some(app_type.clone());
             }
             return Some(pct);
         }
-        // 焦点 app 无数据（第三方），回退到上一个有数据的官方 app
-        let last = TRAY_LAST_OFFICIAL_APP
+        // 焦点 app 无数据（第三方），回退到上一个有数据的 app
+        let last = TRAY_LAST_APP_WITH_DATA
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
         if let Some(ref last_app) = last {
-            return get_section_subscription_pct(app_state, last_app);
+            return get_section_usage_pct(app_state, last_app);
         }
         return None;
     }
@@ -268,7 +307,7 @@ fn compute_tray_worst_pct(app_state: &crate::store::AppState) -> Option<f64> {
     // 启动期无焦点：取所有 section 最大值
     let mut worst: Option<f64> = None;
     for section in TRAY_SECTIONS.iter() {
-        if let Some(pct) = get_section_subscription_pct(app_state, &section.app_type) {
+        if let Some(pct) = get_section_usage_pct(app_state, &section.app_type) {
             worst = Some(worst.map_or(pct, |w: f64| w.max(pct)));
         }
     }
@@ -1216,8 +1255,8 @@ pub(crate) async fn refresh_all_usage_in_tray(app: &tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_script_summary, format_subscription_detail_from_quota, format_subscription_summary,
-        TRAY_ID,
+        extract_script_pct, format_script_summary, format_subscription_detail_from_quota,
+        format_subscription_summary, TRAY_ID,
     };
     use crate::provider::{UsageData, UsageResult};
     use crate::services::subscription::{
@@ -1659,5 +1698,57 @@ mod tests {
     fn script_summary_empty_data_returns_none() {
         let r = usage_result(true, vec![]);
         assert!(format_script_summary(&r).is_none());
+    }
+
+    // ── extract_script_pct (ring icon data source) ─────────────────────────────
+
+    #[test]
+    fn extract_script_pct_token_plan_picks_worst_tier() {
+        // Coding Plan：双 tier 取较高的（更接近上限的）— 与官方订阅环图行为一致。
+        let r = usage_result(
+            true,
+            vec![
+                usage_data(Some(TIER_FIVE_HOUR), 12.0),
+                usage_data(Some(TIER_WEEKLY_LIMIT), 80.0),
+            ],
+        );
+        assert_eq!(extract_script_pct(&r), Some(80.0));
+    }
+
+    #[test]
+    fn extract_script_pct_single_tier_old_zhipu_plan() {
+        // 老套餐智谱 / 单 tier 场景：直接返回该 tier 的利用率。
+        let r = usage_result(true, vec![usage_data(Some(TIER_FIVE_HOUR), 35.0)]);
+        assert_eq!(extract_script_pct(&r), Some(35.0));
+    }
+
+    #[test]
+    fn extract_script_pct_failure_returns_none() {
+        let r = usage_result(false, vec![usage_data(Some(TIER_FIVE_HOUR), 12.0)]);
+        assert_eq!(extract_script_pct(&r), None);
+    }
+
+    #[test]
+    fn extract_script_pct_no_data_returns_none() {
+        let r = usage_result(true, vec![]);
+        assert_eq!(extract_script_pct(&r), None);
+    }
+
+    #[test]
+    fn extract_script_pct_balance_script_without_total_returns_none() {
+        // 余额型脚本（DeepSeek / OpenRouter / Novita）：通常 total = None，
+        // tier_pct 返回 None，自然不会驱动环图 —— 这是期望行为。
+        let balance_data = UsageData {
+            plan_name: Some("USD".to_string()),
+            extra: None,
+            is_valid: Some(true),
+            invalid_message: None,
+            total: None,
+            used: None,
+            remaining: Some(42.5),
+            unit: Some("USD".to_string()),
+        };
+        let r = usage_result(true, vec![balance_data]);
+        assert_eq!(extract_script_pct(&r), None);
     }
 }
