@@ -79,6 +79,9 @@ pub struct TrayAppSection {
 pub const AUTO_SUFFIX: &str = "auto";
 pub const TRAY_ID: &str = "cc-switch";
 
+/// `Provider.category` 值：标识官方订阅型供应商，决定是否能走 subscription quota fallback。
+const CATEGORY_OFFICIAL: &str = "official";
+
 pub const TRAY_SECTIONS: [TrayAppSection; 3] = [
     TrayAppSection {
         app_type: AppType::Claude,
@@ -233,48 +236,43 @@ fn extract_script_pct(result: &crate::provider::UsageResult) -> Option<f64> {
         .reduce(f64::max)
 }
 
-/// 获取指定 app 当前供应商的最高 tier 利用率（0–100），用作环图取数源。
+/// 获取指定 app 当前供应商的最高 tier 利用率（0–100），用作图标填色取数源。
 ///
-/// 优先级（与 `format_usage_detail_line` 对齐）：
-/// 1. 启用了 usage_script 的供应商 → 读脚本缓存。覆盖范围包括：
-///    - 智谱 / Kimi For Coding / MiniMax 等 cn_official 类别的 Coding Plan
-///    - GitHub Copilot（premium quota 的 used/total 是 request 数，比例有意义）
-///    - 任何用户自定义脚本，只要 UsageData 提供有效的 used/total 对
-/// 2. 类别为 official 的供应商（Claude / Codex / Gemini 官方订阅）
-///    → 读 subscription 缓存。
+/// 数据源选择与 `format_usage_detail_line` / 主界面 ProviderCard ladder 一致：
+/// - category == official  → 只读 subscription 缓存（双轨 provider 也走这条）
+/// - 非 official + 脚本启用 → 只读 script 缓存（覆盖 cn_official Coding Plan：智谱 /
+///   Kimi / MiniMax，以及 GitHub Copilot、任意用户脚本）
+/// - 非 official + 脚本关闭 → None
 ///
-/// 无缓存或两条路径都拿不到数据时返回 None；余额型脚本（DeepSeek / OpenRouter
-/// 等通常 total = None）会被 `tier_pct` 自然过滤，不污染环图。
+/// 余额型脚本（DeepSeek / OpenRouter 等 total = None）由 `tier_pct` 自然过滤。
 #[cfg(target_os = "macos")]
 fn get_section_usage_pct(app_state: &crate::store::AppState, app_type: &AppType) -> Option<f64> {
     let current_id = crate::settings::get_effective_current_provider(&app_state.db, app_type)
         .ok()
         .flatten()?;
-    let providers = app_state.db.get_all_providers(app_type.as_str()).ok()?;
-    let provider = providers.get(&current_id)?;
+    let provider = app_state
+        .db
+        .get_provider_by_id(&current_id, app_type.as_str())
+        .ok()
+        .flatten()?;
 
-    // 脚本型用量优先：覆盖 cn_official 类别的 Coding Plan（智谱 / Kimi / MiniMax），
-    // 这些供应商的数据写入脚本缓存而非 subscription 缓存。
+    if provider.category.as_deref() == Some(CATEGORY_OFFICIAL) {
+        return app_state
+            .usage_cache
+            .with_subscription(app_type, |quota| {
+                quota.tiers.iter().map(|t| t.utilization).reduce(f64::max)
+            })
+            .flatten();
+    }
+
     if provider.has_usage_script_enabled() {
-        if let Some(pct) = app_state
+        return app_state
             .usage_cache
             .with_script(app_type, &current_id, extract_script_pct)
-            .flatten()
-        {
-            return Some(pct);
-        }
+            .flatten();
     }
 
-    // 官方订阅 fallback（Claude / Codex / Gemini）
-    if provider.category.as_deref() != Some("official") {
-        return None;
-    }
-    app_state
-        .usage_cache
-        .with_subscription(app_type, |quota| {
-            quota.tiers.iter().map(|t| t.utilization).reduce(f64::max)
-        })
-        .flatten()
+    None
 }
 
 /// 扫描所有 section（Claude / Codex / Gemini）找最大利用率，并把贡献该最大值
@@ -364,8 +362,19 @@ pub(crate) fn reset_tray_refresh_throttle() {
         .unwrap_or_else(|p| p.into_inner()) = None;
 }
 
-/// Update the tray icon to show the original icon with a colored progress arc overlaid.
-/// Only fires when subscription data is available and the setting is enabled.
+/// 重置托盘图标为模板基底，撤销之前可能渲染过的彩色环。
+#[cfg(target_os = "macos")]
+fn restore_base_tray_icon(app: &tauri::AppHandle) {
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        return;
+    };
+    let _ = tray.set_icon_as_template(true);
+    let (base, w, h) = &*ICON_BASE_RGBA;
+    let icon = tauri::image::Image::new(base, *w, *h);
+    let _ = tray.set_icon(Some(icon));
+}
+
+/// 根据当前 worst-pct 渲染托盘图标：开关关闭或无数据时恢复模板基底，否则叠加彩色进度环。
 #[cfg(target_os = "macos")]
 fn update_tray_icon(app: &tauri::AppHandle) {
     let Some(app_state) = app.try_state::<crate::store::AppState>() else {
@@ -374,31 +383,19 @@ fn update_tray_icon(app: &tauri::AppHandle) {
     let enabled = crate::settings::get_settings().tray_progress_icon;
     if !enabled {
         if let Ok(mut last) = LAST_TRAY_ICON_PCT.lock() {
-            *last = None; // clear so re-enabling shows the icon immediately
+            *last = None; // 清空缓存，下次开启时强制重绘
         }
-        if let Some(tray) = app.tray_by_id(TRAY_ID) {
-            let _ = tray.set_icon_as_template(true);
-            let (base, w, h) = &*ICON_BASE_RGBA;
-            let icon = tauri::image::Image::new(base, *w, *h);
-            let _ = tray.set_icon(Some(icon));
-        }
+        restore_base_tray_icon(app);
         return;
     }
     let Some(pct) = compute_tray_worst_pct(&app_state) else {
-        // Data disappeared (e.g. switched to a third-party provider).
-        // If we previously rendered a ring icon, clear the cache and restore
-        // the base template so a stale colored arc is not left on screen.
+        // 数据消失（例如切到第三方 provider）：之前渲染过环图就恢复基底，避免残留旧色弧。
         let had_icon = LAST_TRAY_ICON_PCT
             .lock()
             .map(|mut g| g.take().is_some())
             .unwrap_or(false);
         if had_icon {
-            if let Some(tray) = app.tray_by_id(TRAY_ID) {
-                let _ = tray.set_icon_as_template(true);
-                let (base, w, h) = &*ICON_BASE_RGBA;
-                let icon = tauri::image::Image::new(base, *w, *h);
-                let _ = tray.set_icon(Some(icon));
-            }
+            restore_base_tray_icon(app);
         }
         return;
     };
@@ -507,12 +504,9 @@ fn format_subscription_summary(
     Some(format!("{emoji} {body}"))
 }
 
-/// Combines subscription usage and reset countdown into a single-line detail string
-/// suitable for rendering as a dedicated disabled menu item beneath the app submenu.
-/// Returns `None` when the quota indicates failure or no known tiers are present.
-/// Builds the second-line detail string shown beneath each app's submenu entry.
-/// Format matches the main-window subscription footer:
-/// `emoji tier%  countdown  tier%  countdown …`  (countdown omitted when reset is past)
+/// 把订阅用量与重置倒计时合并成 app 子菜单下的第二行 detail 字符串。
+/// 格式与主界面订阅页脚一致：`emoji tier%  countdown  tier%  countdown …`（重置已过则省略 countdown）。
+/// `quota.success == false` 或未识别 tier 时返回 `None`，由调用方决定是否插入 disabled MenuItem。
 pub(crate) fn format_subscription_detail_from_quota(
     quota: &crate::services::subscription::SubscriptionQuota,
 ) -> Option<String> {
@@ -618,34 +612,41 @@ fn format_script_summary(result: &crate::provider::UsageResult) -> Option<String
     }
 }
 
-/// Builds the detail line text shown beneath each app's submenu (e.g. "   🟢 h9% w27% · ⏱ h 1h 30m").
-/// Script usage takes priority over subscription quota. Returns `None` when the cache has no data.
+/// 构建 app 子菜单下方那行额度 detail 文本（如 "🟢 h9% w27% · ⏱ h 1h 30m"）。
+/// 数据源选择与主界面 ProviderCard 一致：official 走订阅缓存，否则走脚本缓存；缓存为空返回 `None`。
 fn format_usage_detail_line(
     app_state: &AppState,
     app_type: &AppType,
     provider: &crate::provider::Provider,
     provider_id: &str,
 ) -> Option<String> {
-    if provider.has_usage_script_enabled() {
-        let s = app_state
-            .usage_cache
-            .with_script(app_type, provider_id, format_script_summary)
-            .flatten()?;
-        return Some(s);
-    } else {
+    let script_enabled = provider.has_usage_script_enabled();
+    if !script_enabled {
+        // 用户关掉脚本时顺手清掉缓存，避免再次启用时残留旧数据。
         app_state
             .usage_cache
             .invalidate_script(app_type, provider_id);
     }
 
-    if provider.category.as_deref() != Some("official") {
-        return None;
+    // 与主界面 ProviderCard ladder 对齐（src/components/providers/ProviderCard.tsx）：
+    // - category == official  → 只看 subscription（即便挂了脚本，主界面也只渲染 SubscriptionQuotaFooter）
+    // - 非 official + 脚本启用 → 只看 script cache
+    // - 非 official + 脚本关闭 → 无 detail 行
+    if provider.category.as_deref() == Some(CATEGORY_OFFICIAL) {
+        return app_state
+            .usage_cache
+            .with_subscription(app_type, format_subscription_detail_from_quota)
+            .flatten();
     }
 
-    app_state
-        .usage_cache
-        .with_subscription(app_type, format_subscription_detail_from_quota)
-        .flatten()
+    if script_enabled {
+        return app_state
+            .usage_cache
+            .with_script(app_type, provider_id, format_script_summary)
+            .flatten();
+    }
+
+    None
 }
 
 /// 对供应商列表排序：sort_index → created_at → name
@@ -912,7 +913,7 @@ pub fn create_tray_menu(
             for (id, provider) in sort_providers(&providers) {
                 let is_current = current_id == *id;
                 let is_official_blocked =
-                    is_app_taken_over && provider.category.as_deref() == Some("official");
+                    is_app_taken_over && provider.category.as_deref() == Some(CATEGORY_OFFICIAL);
                 let label = if is_official_blocked {
                     format!("{} \u{26D4}", &provider.name) // ⛔ emoji
                 } else {
@@ -1058,20 +1059,42 @@ fn update_tray_usage_labels(app: &tauri::AppHandle) {
     }
 }
 
-pub fn refresh_tray_menu(app: &tauri::AppHandle) {
+/// 重建托盘菜单并刷新 macOS 圆环图标。
+/// 返回 `Ok(true)` 表示菜单已替换；`Ok(false)` 表示托盘尚未挂载（启动期）；
+/// `Err` 表示 `create_tray_menu` 或 `set_menu` 失败，由调用方决定是否上报。
+/// 图标刷新独立于菜单结果，永远在末尾执行——它读自己的缓存，不依赖菜单数据。
+pub fn try_refresh_tray_menu(app: &tauri::AppHandle) -> Result<bool, String> {
     use crate::store::AppState;
 
-    if let Some(state) = app.try_state::<AppState>() {
-        if let Ok(new_menu) = create_tray_menu(app, state.inner()) {
-            if let Some(tray) = app.tray_by_id(TRAY_ID) {
-                if let Err(e) = tray.set_menu(Some(new_menu)) {
-                    log::error!("刷新托盘菜单失败: {e}");
+    let result: Result<bool, String> = if let Some(state) = app.try_state::<AppState>() {
+        match create_tray_menu(app, state.inner()) {
+            Ok(new_menu) => {
+                if let Some(tray) = app.tray_by_id(TRAY_ID) {
+                    tray.set_menu(Some(new_menu))
+                        .map(|_| true)
+                        .map_err(|e| format!("更新托盘菜单失败: {e}"))
+                } else {
+                    Ok(false)
                 }
             }
+            Err(err) => Err(format!("创建托盘菜单失败: {err}")),
         }
-    }
+    } else {
+        Ok(false)
+    };
+
     #[cfg(target_os = "macos")]
     update_tray_icon(app);
+
+    result
+}
+
+/// Fire-and-forget 版 `try_refresh_tray_menu`：把错误吞掉记日志，给 lightweight/warmup
+/// 等不在意失败的调用方使用。前端 Tauri command 路径请直接调用 `try_refresh_tray_menu`。
+pub fn refresh_tray_menu(app: &tauri::AppHandle) {
+    if let Err(e) = try_refresh_tray_menu(app) {
+        log::error!("{e}");
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1237,9 +1260,22 @@ pub(crate) async fn refresh_all_usage_in_tray(app: &tauri::AppHandle) {
             }
         };
 
-        // 与 format_usage_detail_line 同一优先级：脚本启用 → 查脚本；
-        // 否则当前 provider 是 official → 查订阅；其它情况不发请求。
-        if current.has_usage_script_enabled() {
+        // 与 format_usage_detail_line / get_section_usage_pct 同一 ladder：
+        // - official  → 刷订阅缓存（双轨 provider 也走这条，避免读写不一致）
+        // - 非 official + 脚本启用 → 刷脚本缓存
+        // - 其它      → 不发请求
+        if current.category.as_deref() == Some(CATEGORY_OFFICIAL) {
+            let app_clone = app.clone();
+            let state = app.state::<AppState>();
+            let tool = app_type_str.to_string();
+            subscription_futures.push(async move {
+                if let Err(e) =
+                    crate::commands::get_subscription_quota(app_clone, state, tool).await
+                {
+                    log::debug!("[Tray] 刷新{log_name}订阅用量失败（可能未登录）: {e}");
+                }
+            });
+        } else if current.has_usage_script_enabled() {
             let app_clone = app.clone();
             let state = app.state::<AppState>();
             let copilot_state = app.state::<CopilotAuthState>();
@@ -1256,17 +1292,6 @@ pub(crate) async fn refresh_all_usage_in_tray(app: &tauri::AppHandle) {
                 .await
                 {
                     log::debug!("[Tray] 刷新{log_name}供应商 {provider_id} 用量失败: {e}");
-                }
-            });
-        } else if current.category.as_deref() == Some("official") {
-            let app_clone = app.clone();
-            let state = app.state::<AppState>();
-            let tool = app_type_str.to_string();
-            subscription_futures.push(async move {
-                if let Err(e) =
-                    crate::commands::get_subscription_quota(app_clone, state, tool).await
-                {
-                    log::debug!("[Tray] 刷新{log_name}订阅用量失败（可能未登录）: {e}");
                 }
             });
         }
