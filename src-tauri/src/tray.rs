@@ -771,12 +771,8 @@ fn handle_auto_click(app: &tauri::AppHandle, app_type: &AppType) -> Result<(), A
             )));
         }
 
-        // 4) 更新托盘菜单
-        if let Ok(new_menu) = create_tray_menu(app, app_state.inner()) {
-            if let Some(tray) = app.tray_by_id(TRAY_ID) {
-                let _ = tray.set_menu(Some(new_menu));
-            }
-        }
+        // 4) 更新托盘菜单 + 同步刷新环图（Auto 切到队列 P1 后利用率往往变化）
+        refresh_tray_menu(app);
 
         // 5) 发射事件到前端
         let event_data = serde_json::json!({
@@ -820,12 +816,9 @@ fn handle_provider_click(
         )
         .map_err(AppError::Message)?;
 
-        // 更新托盘菜单
-        if let Ok(new_menu) = create_tray_menu(app, app_state.inner()) {
-            if let Some(tray) = app.tray_by_id(TRAY_ID) {
-                let _ = tray.set_menu(Some(new_menu));
-            }
-        }
+        // 更新托盘菜单 + 环图（switch_provider 已刷过图标一次，这里复用 helper
+        // 重建菜单并兜底再刷一次图标，确保 auto_failover 关闭后的状态同步）
+        refresh_tray_menu(app);
 
         // 发射事件到前端
         let event_data = serde_json::json!({
