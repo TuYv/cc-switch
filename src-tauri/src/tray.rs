@@ -277,40 +277,11 @@ fn get_section_usage_pct(app_state: &crate::store::AppState, app_type: &AppType)
         .flatten()
 }
 
-/// 根据主界面焦点和设置计算托盘图标应展示的利用率。
-/// - 有焦点且有数据 → 该 app 的利用率，并记录为 last_app_with_data
-/// - 有焦点但无数据（第三方/无订阅）→ fallback 到 last_app_with_data
-/// - 无焦点记录（启动期）→ 所有 section 的最大值，并把贡献该最大值的 app
-///   也写入 last_app_with_data，以便后续切到第三方 app 时仍有 fallback 可用
+/// 扫描所有 section（Claude / Codex / Gemini）找最大利用率，并把贡献该最大值
+/// 的 app 写入 `TRAY_LAST_APP_WITH_DATA`。供"无焦点启动期"和"焦点指向无数据 app
+/// 但 last_app 也是空"两条 race 路径共享。
 #[cfg(target_os = "macos")]
-fn compute_tray_worst_pct(app_state: &crate::store::AppState) -> Option<f64> {
-    let focused = TRAY_FOCUSED_APP
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clone();
-
-    if let Some(ref app_type) = focused {
-        if let Some(pct) = get_section_usage_pct(app_state, app_type) {
-            // 记录最近有数据的 app（含官方订阅 / Coding Plan / Copilot 等脚本型）
-            if let Ok(mut last) = TRAY_LAST_APP_WITH_DATA.lock() {
-                *last = Some(app_type.clone());
-            }
-            return Some(pct);
-        }
-        // 焦点 app 无数据（第三方），回退到上一个有数据的 app
-        let last = TRAY_LAST_APP_WITH_DATA
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
-        if let Some(ref last_app) = last {
-            return get_section_usage_pct(app_state, last_app);
-        }
-        return None;
-    }
-
-    // 启动期无焦点：取所有 section 最大值，并把"贡献最大值的 app"写入
-    // TRAY_LAST_APP_WITH_DATA。否则一旦焦点之后切到第三方 app（OpenCode /
-    // OpenClaw / Hermes 等），fallback 路径会读到 None 而把刚画好的环图清掉。
+fn scan_all_sections_and_seed_last(app_state: &crate::store::AppState) -> Option<f64> {
     let mut worst: Option<(f64, AppType)> = None;
     for section in TRAY_SECTIONS.iter() {
         if let Some(pct) = get_section_usage_pct(app_state, &section.app_type) {
@@ -326,6 +297,45 @@ fn compute_tray_worst_pct(app_state: &crate::store::AppState) -> Option<f64> {
         }
     }
     worst.map(|(pct, _)| pct)
+}
+
+/// 根据主界面焦点和设置计算托盘图标应展示的利用率。
+/// - 有焦点且有数据 → 该 app 的利用率，并记录为 last_app_with_data
+/// - 有焦点但无数据 → 优先用 last_app_with_data；若 last_app 也是空（启动 race：
+///   前端 focus 通知比 warmup 先到，且焦点指向无数据 app 如 OpenCode/Hermes），
+///   则就地扫一遍所有 section，避免环图卡在灰白等用户手动切 tab
+/// - 无焦点（启动期初始）→ 扫所有 section，同时 seed last_app_with_data
+#[cfg(target_os = "macos")]
+fn compute_tray_worst_pct(app_state: &crate::store::AppState) -> Option<f64> {
+    let focused = TRAY_FOCUSED_APP
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+
+    if let Some(ref app_type) = focused {
+        if let Some(pct) = get_section_usage_pct(app_state, app_type) {
+            // 记录最近有数据的 app（含官方订阅 / Coding Plan / Copilot 等脚本型）
+            if let Ok(mut last) = TRAY_LAST_APP_WITH_DATA.lock() {
+                *last = Some(app_type.clone());
+            }
+            return Some(pct);
+        }
+        // 焦点 app 无数据（第三方），优先回退到上一个有数据的 app
+        let last = TRAY_LAST_APP_WITH_DATA
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if let Some(ref last_app) = last {
+            if let Some(pct) = get_section_usage_pct(app_state, last_app) {
+                return Some(pct);
+            }
+        }
+        // last_app 也是空（启动 race）→ 扫所有 section 兜底并 seed
+        return scan_all_sections_and_seed_last(app_state);
+    }
+
+    // 启动期无焦点
+    scan_all_sections_and_seed_last(app_state)
 }
 
 /// 前端通知主界面 activeApp 切换时调用，更新焦点并刷新托盘图标。
