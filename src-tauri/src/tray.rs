@@ -280,7 +280,8 @@ fn get_section_usage_pct(app_state: &crate::store::AppState, app_type: &AppType)
 /// 根据主界面焦点和设置计算托盘图标应展示的利用率。
 /// - 有焦点且有数据 → 该 app 的利用率，并记录为 last_app_with_data
 /// - 有焦点但无数据（第三方/无订阅）→ fallback 到 last_app_with_data
-/// - 无焦点记录（启动期）→ 所有 section 的最大值
+/// - 无焦点记录（启动期）→ 所有 section 的最大值，并把贡献该最大值的 app
+///   也写入 last_app_with_data，以便后续切到第三方 app 时仍有 fallback 可用
 #[cfg(target_os = "macos")]
 fn compute_tray_worst_pct(app_state: &crate::store::AppState) -> Option<f64> {
     let focused = TRAY_FOCUSED_APP
@@ -307,14 +308,24 @@ fn compute_tray_worst_pct(app_state: &crate::store::AppState) -> Option<f64> {
         return None;
     }
 
-    // 启动期无焦点：取所有 section 最大值
-    let mut worst: Option<f64> = None;
+    // 启动期无焦点：取所有 section 最大值，并把"贡献最大值的 app"写入
+    // TRAY_LAST_APP_WITH_DATA。否则一旦焦点之后切到第三方 app（OpenCode /
+    // OpenClaw / Hermes 等），fallback 路径会读到 None 而把刚画好的环图清掉。
+    let mut worst: Option<(f64, AppType)> = None;
     for section in TRAY_SECTIONS.iter() {
         if let Some(pct) = get_section_usage_pct(app_state, &section.app_type) {
-            worst = Some(worst.map_or(pct, |w: f64| w.max(pct)));
+            match worst {
+                Some((w, _)) if w >= pct => {}
+                _ => worst = Some((pct, section.app_type.clone())),
+            }
         }
     }
-    worst
+    if let Some((_, ref app_type)) = worst {
+        if let Ok(mut last) = TRAY_LAST_APP_WITH_DATA.lock() {
+            *last = Some(app_type.clone());
+        }
+    }
+    worst.map(|(pct, _)| pct)
 }
 
 /// 前端通知主界面 activeApp 切换时调用，更新焦点并刷新托盘图标。
