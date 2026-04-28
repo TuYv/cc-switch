@@ -218,6 +218,9 @@ pub(crate) fn generate_ring_icon_rgba(utilization_pct: Option<f64>, size: u32) -
 /// 与 `format_usage_detail_line` 保持一致：脚本缓存承载 Coding Plan / Copilot /
 /// 自定义脚本三类数据。`tier_pct` 自然降级 —— 缺失 `total` 的余额脚本（DeepSeek、
 /// OpenRouter 等）会返回 None，不会污染环图。
+///
+/// 仅 macOS 环图调用；为方便在所有平台跑单测，cfg 同时放行 `test`。
+#[cfg(any(target_os = "macos", test))]
 fn extract_script_pct(result: &crate::provider::UsageResult) -> Option<f64> {
     if !result.success {
         return None;
